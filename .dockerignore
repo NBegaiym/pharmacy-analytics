@@ -1,0 +1,8 @@
+.venv/
+data/raw/
+data/processed/
+.git/
+.env
+credentials/
+__pycache__/
+*.pyc

@@ -1,0 +1,22 @@
+# Python virtual env
+.venv/
+__pycache__/
+*.pyc
+
+# Данные не публикуются: исходные файлы получаются отдельно, промежуточные
+# регенерируются etl-скриптами из data/raw/.
+data/
+*.parquet
+
+# Секреты: репозиторий публичный, реквизиты доступа и .env в git не попадают.
+credentials/
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
