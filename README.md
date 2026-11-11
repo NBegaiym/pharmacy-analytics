@@ -1,95 +1,163 @@
-# pharmacy-analytics
+# Аналитика аптечной сети: от сырых выгрузок до дашбордов CEO и COO
 
-Аналитика розницы аптечной сети: профилирование и очистка сырых SFTP-выгрузок, Postgres,
-SQL-вьюхи под дашборды, Metabase для CEO/COO. Контекст и постановка задачи — в `docs/`.
+Сквозной аналитический проект на реальных (псевдонимизированных) данных розничной аптечной сети за апрель 2023:
+13 сырых файлов (~3.3 GB, крупнейший — 12.7 млн строк) → профилирование и очистка → Postgres → SQL-витрины →
+два дашборда в Metabase для руководства.
 
-## Как это устроено
+Выполнен как тестовое задание. Формат работы — **я в роли продакт-менеджера, техническая реализация — в паре с
+ИИ-ассистентом (Claude)**. Подробнее — в разделе [«Моя роль»](#моя-роль).
+
+**Стек:** Python (pandas, pyarrow, SQLAlchemy) · PostgreSQL · SQL (materialized views) · Metabase + REST API ·
+Docker · Coolify (self-hosted деплой)
+
+---
+
+## Задача
+
+Дать руководству сети инструмент для четырёх управленческих решений:
+
+| Решение | Для кого | Что показывает дашборд |
+|---|---|---|
+| Закрыть аптеку или оставить? | CEO | рейтинг аптек по выручке и марже, «матрица здоровья», стабильность продаж, деньги в неликвиде, списания |
+| Уволить сотрудника или оставить? | COO | выручка и маржа на сотрудника **относительно своей аптеки**, продуктивность на рабочий день, позиций в чеке |
+| Товар увезти или привезти? | CEO / COO | скорость продаж, дни запаса, дефицит, кандидаты на перемещение между аптеками, риск списания по сроку годности |
+| Как увеличить число позиций в чеке? | COO | распределение размера чека, динамика по часам, «товары-одиночки», частые пары товаров в одном чеке |
+
+Сверх ТЗ добавлены гипотезы: сетевой P&L, комиссия эквайринга Kaspi, разброс закупочных цен у поставщиков,
+загрузка кассиров в часы пик, аномалии в чеках (индикатор ошибок или фрода).
+
+**Результат:** 2 дашборда (CEO — сеть целиком, COO — конкретная аптека), 26 карточек, 8 SQL-файлов с 24 витринами.
+Обоснование каждой карточки — в [`docs/hypotheses.md`](docs/hypotheses.md).
+
+<!-- Скриншоты дашбордов: положить в docs/img/ и раскомментировать
+![Дашборд CEO](docs/img/ceo_dashboard.png)
+![Дашборд COO](docs/img/coo_dashboard.png)
+-->
+
+---
+
+## Что нашли в данных
+
+До построения дашбордов данные были полностью профилированы
+([`docs/data_profile.md`](docs/data_profile.md)). Несколько находок изменили саму постановку:
+
+- **Выписки Kaspi нельзя привязать к аптекам.** Поле «№ документа» совпадало с номерами чеков на 100%, но
+  это оказался статистический артефакт: ~60 уникальных значений на файл, то есть номер пакета расчётов, а не чека.
+  Поэтому комиссия эквайринга и доля безнала считаются только по сети целиком — карточки с разбивкой по аптекам
+  убраны, а не показаны с ложной точностью.
+- **Файл остатков (12.7 млн строк) хранится по партиям, а не по товарам.** Из-за этого у 51% строк остаток
+  отрицательный. Перед любой метрикой нужна агрегация до уровня «день × аптека × товар».
+- **За последний день периода остаток равен нулю в 100% строк** (накануне — 0.7%). Это артефакт выгрузки,
+  поэтому «текущий остаток» берётся на 29.04.
+- **У 79% аптек из справочника нет ни одной продажи за месяц.** Витрины строятся от фактической активности
+  (122–129 работающих аптек), а не от справочника.
+- **Справочники городов расходятся в 19% аптек**, часть сотрудников работает в нескольких аптеках, сроки
+  годности содержат мусорные даты (год 520, 8202). Каждое такое решение по очистке задокументировано.
+- **Данные — только один месяц.** На дашбордах это явно подписано: «тренд» здесь — динамика внутри месяца,
+  а решение о закрытии аптеки по 30 дням требует осторожности.
+
+---
+
+## Моя роль
+
+Полный рассказ о том, как делилась работа, — в [`docs/report.md`](docs/report.md). Коротко:
+
+**Я:**
+- поставила задачу и рамки, разделила гипотезы из ТЗ и предложенные ИИ, выбрала, какие из дополнительных брать в работу;
+- решила строить сразу в финальной конфигурации на сервере, а не локально с переносом «потом» — чтобы ошибки
+  переноса не всплыли в конце;
+- вручную развернула инфраструктуру на Coolify: сервер, Postgres, публичный доступ к базе;
+- тестировала дашборды как пользователь и формулировала требования: читаемость графиков и осей, структура
+  коллекций, поведение фильтров.
+
+**ИИ-ассистент:** профилирование и интерпретация проблем качества данных, ETL-код, SQL-витрины, скрипт сборки
+дашбордов через REST API Metabase.
+
+---
+
+## Как устроено
 
 ```
-data/raw/        -- сырые файлы с SFTP (в git не попадают, см. .gitignore)
-data/processed/  -- результат Этапа 3 (parquet, в git не попадают -- регенерируются etl/02)
-etl/
-  01_profiling.py         -- профилирование сырых данных -> печатает отчёт в stdout
-  02_clean_transform.py   -- очистка/типизация -> data/processed/*.parquet
-  03_load_to_db.py        -- загрузка parquet в Postgres, схема staging
-sql/marts/         -- SQL-вьюхи поверх staging для Metabase (см. ниже)
-docs/
-  data_profile.md  -- что за таблицы, что в них, проблемы качества данных (Этап 1)
-  hypotheses.md    -- гипотезы дашбордов CEO/COO, разбивка по вьюхам (Этап 2)
-  report.md        -- пишется вручную, не трогать
+data/raw/  (13 файлов с SFTP, в git не публикуются)
+   │
+   ├─ etl/01_profiling.py        профилирование → отчёт о качестве данных
+   ├─ etl/02_clean_transform.py  очистка и типизация → data/processed/*.parquet
+   └─ etl/03_load_to_db.py       загрузка в Postgres, схема staging
+                                     │
+sql/marts/*.sql                  витрины в схеме marts (для тяжёлых — materialized views)
+                                     │
+metabase/build_dashboards.py     26 карточек и 2 дашборда через REST API — воспроизводимо кодом, а не руками в UI
 ```
 
-Полный разбор данных, найденных проблем качества и решений по очистке — в
-[`docs/data_profile.md`](docs/data_profile.md). Что именно показывает каждый дашборд и почему —
-в [`docs/hypotheses.md`](docs/hypotheses.md).
+| Папка | Содержимое |
+|---|---|
+| [`etl/`](etl/) | Python-пайплайн: профилирование, очистка, загрузка |
+| [`sql/marts/`](sql/marts/) | 8 SQL-файлов витрин: `store_health`, `employee_performance`, `sku_movement`, `basket_analysis`, `payment_mix`, `procurement_efficiency`, `staffing_load`, `receipt_anomalies` |
+| [`metabase/`](metabase/) | Скрипт сборки дашбордов |
+| [`docs/`](docs/) | Профиль данных, гипотезы, отчёт о работе |
 
-## Как запустить с нуля
+Инженерные детали, которые стоит отметить:
+- витрины над файлом остатков сделаны `MATERIALIZED VIEW`: обычная вьюха пересчитывалась 2+ минуты на каждый
+  запрос из Metabase;
+- дашборды собираются скриптом, потому что Metabase не хранит вопросы и дашборды в git — иначе их нельзя
+  воспроизвести;
+- данные и реквизиты доступа в образ Docker не запекаются, а пробрасываются при запуске.
+
+---
+
+## Запуск
+
+> Это публичная копия для портфолио. Исходные данные (`data/`) и реквизиты доступа (`credentials/`, `.env`)
+> не публикуются, а развёрнутые Postgres и Metabase больше не работают — поэтому запустить проект только из
+> этого репозитория нельзя. Инструкция ниже описывает, как он запускался.
+
+<details>
+<summary>Пошаговая инструкция</summary>
 
 ### 1. Python-окружение
 
-```
+```bash
 python -m venv .venv
-.venv/Scripts/python.exe -m pip install pandas openpyxl pyarrow sqlalchemy psycopg2-binary python-dotenv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install pandas openpyxl pyarrow sqlalchemy psycopg2-binary python-dotenv
 ```
 
-### 2. Положить сырые файлы
+### 2. Данные и база
 
-Скачать выгрузку по SFTP в `data/raw/` (13 файлов, см. состав в `docs/data_profile.md`, раздел 1).
+Положить 13 файлов выгрузки в `data/raw/` (состав — в [`docs/data_profile.md`](docs/data_profile.md), раздел 1).
+Создать базу Postgres и отдельную роль (не суперпользователь), параметры подключения — в `.env` по шаблону
+`.env.example`.
 
-### 3. Postgres
+### 3. Пайплайн
 
-Нужна база Postgres (локально или в Coolify) и отдельная роль (не системный суперпользователь).
-Параметры подключения берутся из `.env` в корне репозитория (шаблон — `.env.example`):
-
-```
-POSTGRES_HOST=127.0.0.1
-POSTGRES_PORT=5432
-POSTGRES_DB=pharmacy_analytics
-POSTGRES_USER=pharmacy_app
-POSTGRES_PASSWORD=...
+```bash
+python etl/01_profiling.py        # ~2 мин, отчёт в консоль
+python etl/02_clean_transform.py  # ~3.5 мин, data/processed/*.parquet
+python etl/03_load_to_db.py       # ~4 мин, загрузка в Postgres (схема staging)
 ```
 
-### 4. Прогнать пайплайн по порядку
+То же в Docker:
 
-```
-.venv/Scripts/python.exe etl/01_profiling.py        # ~2 мин, печатает отчёт в консоль
-.venv/Scripts/python.exe etl/02_clean_transform.py   # ~3.5 мин, пишет data/processed/*.parquet
-.venv/Scripts/python.exe etl/03_load_to_db.py        # ~4 мин, грузит в Postgres (схема staging)
-```
-
-Тот же пайплайн — в Docker, без локальной установки Python (см. `Dockerfile`; собран, но не
-пересобирался локально — на этой машине нет Docker, сборку проверяет Coolify/CI):
-
-```
+```bash
 docker build -t pharmacy-analytics-etl .
 docker run --rm \
     -v "$(pwd)/data:/app/data" \
     -v "$(pwd)/.env:/app/.env:ro" \
     pharmacy-analytics-etl python etl/03_load_to_db.py
 ```
-Образ содержит только код (`etl/`, `sql/`) — `data/raw/` и `.env` пробрасываются volume-mount'ом
-при запуске, в образ не запекаются (см. `.dockerignore`).
 
-### 5. Применить SQL-вьюхи
+### 4. SQL-витрины
 
-Применять **строго в этом порядке** — `store_health.sql` и часть остальных читают из
-`marts.sku_movement`, который создаётся в `sku_movement.sql`:
+Применять строго в этом порядке — остальные витрины читают из `marts.sku_movement`:
 
-```
-psql -U pharmacy_app -h <host> -d pharmacy_analytics -f sql/marts/sku_movement.sql
-psql -U pharmacy_app -h <host> -d pharmacy_analytics -f sql/marts/store_health.sql
-psql -U pharmacy_app -h <host> -d pharmacy_analytics -f sql/marts/employee_performance.sql
-psql -U pharmacy_app -h <host> -d pharmacy_analytics -f sql/marts/basket_analysis.sql
-psql -U pharmacy_app -h <host> -d pharmacy_analytics -f sql/marts/payment_mix.sql
-psql -U pharmacy_app -h <host> -d pharmacy_analytics -f sql/marts/procurement_efficiency.sql
-psql -U pharmacy_app -h <host> -d pharmacy_analytics -f sql/marts/staffing_load.sql
-psql -U pharmacy_app -h <host> -d pharmacy_analytics -f sql/marts/receipt_anomalies.sql
+```bash
+for f in sku_movement store_health employee_performance basket_analysis \
+         payment_mix procurement_efficiency staffing_load receipt_anomalies; do
+  psql -U pharmacy_app -h <host> -d pharmacy_analytics -f sql/marts/$f.sql
+done
 ```
 
-`sku_movement.sql` и часть `basket_analysis.sql` (`product_pair_affinity`) создают
-`MATERIALIZED VIEW` — обычные вьюхи над 12.7M-строчным файлом остатков пересчитывались бы
-на каждый запрос из Metabase (проверено: 2+ минуты на запрос). После перезагрузки staging
-их нужно обновить:
+После перезагрузки staging обновить материализованные вьюхи:
 
 ```sql
 REFRESH MATERIALIZED VIEW marts.stock_daily_by_sku;
@@ -97,30 +165,18 @@ REFRESH MATERIALIZED VIEW marts.sku_movement;
 REFRESH MATERIALIZED VIEW marts.product_pair_affinity;
 ```
 
-Повторный запуск `sku_movement.sql` делает `DROP MATERIALIZED VIEW ... CASCADE` и пересоздаёт
-всё заново (~2-3 мин) — после этого нужно заново применить `store_health.sql` (он зависит от
-`marts.sku_movement`).
+Повторный запуск `sku_movement.sql` пересоздаёт витрину через `DROP ... CASCADE` — после него нужно заново
+применить `store_health.sql`.
 
-### 6. Metabase
+### 5. Metabase
 
-Подключить Metabase к базе `pharmacy_analytics`, схема `marts` — там 24 готовые вьюхи под
-обе панели (CEO и COO), разбивка по картам дашборда — в `docs/hypotheses.md`.
+Подключить Metabase к базе `pharmacy_analytics` (схема `marts`) и собрать дашборды:
 
-Сами дашборды (26 карточек, раскладка, фильтры) созданы не руками в UI, а скриптом через
-REST API Metabase — `metabase/build_dashboards.py`. Metabase не хранит вопросы/дашборды в
-git, поэтому это единственный способ иметь их воспроизводимыми кодом:
-
-```
-METABASE_URL=http://<host> METABASE_API_KEY=<ключ с правами Administrators> \
+```bash
+METABASE_URL=http://<host> METABASE_API_KEY=<ключ администратора> \
     python metabase/build_dashboards.py
 ```
 
-API-ключ — Admin → Настройки → Аутентификация → API-ключи → Создать. Скрипт создаёт НОВЫЙ
-набор карточек при каждом запуске (не ищет существующие по имени) — это скрипт первоначальной
-настройки, не синхронизации.
+Скрипт создаёт новый набор карточек при каждом запуске — это скрипт первоначальной настройки, не синхронизации.
 
-## Что не входит в этот репозиторий
-
-Это публичная копия тестового задания для портфолио. Реквизиты доступа (`credentials/`, `.env`)
-и исходные данные (`data/`) не публикуются, поэтому пайплайн и дашборды нельзя запустить только
-из этого репозитория. Развёрнутые при выполнении задания Metabase и Postgres больше не доступны.
+</details>
